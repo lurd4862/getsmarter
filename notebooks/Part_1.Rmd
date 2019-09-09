@@ -1,0 +1,581 @@
+---
+title: "2U Challenge"
+author: Stefan Fouche
+output:
+  html_notebook:
+    toc: true
+    theme: journal
+    toc_float:
+      collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(reticulate)
+use_condaenv('baseline',required=TRUE)
+
+library(tidyverse)
+```
+
+```{r}
+py_config()
+```
+
+```{python}
+import pandas as pd
+```
+
+## Load and validate data
+
+Validate format of data
+
+```{bash}
+head -n 10 ../data/raw/*.csv
+```
+
+Nothing seems odd about the downloaded data
+
+### Explore data
+
+Before we start it's usually a good idea to get a feel for the data...
+
+Read in the ticket data
+
+```{r}
+ticket_data201803 = data.table::fread("../data/raw/ticket_data201803 (1) (1).csv")
+```
+
+There might be some trouble down the line with character NA's, Ordinal vs Nominal features encoded as pure character strings and also the date time fields not ecoded as date time format.
+
+Create in memory pointer for database and write table
+
+```{r}
+con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+DBI::dbWriteTable(con, "tickets", ticket_data201803)
+```
+
+Check data type stability from database
+
+```{r}
+tickets_tbl = tbl(con, sql('select * from tickets'))
+
+tickets_tbl
+```
+
+Remove data frame
+
+```{r}
+rm(ticket_data201803)
+```
+
+
+Now that our data is loaded onto the sqlite DB let's explore the data a bit
+
+#### Status distribution
+
+```{r}
+tickets_tbl %>% 
+  group_by(status) %>% 
+  tally %>% 
+  ggplot()+
+  geom_bar(aes(x=reorder(status,n),y=n,fill=status),stat = 'identity')+
+  coord_flip()
+```
+
+#### Priority distribution
+
+```{r}
+tickets_tbl %>% 
+  group_by(priority) %>% 
+  tally %>% 
+  ggplot()+
+  geom_bar(aes(x=reorder(priority,n),y=n,fill=priority),stat = 'identity')+
+  coord_flip()+
+  xlab("type")
+```
+
+#### Distribution of top 10 type
+
+```{r}
+tickets_tbl %>% 
+  group_by(type) %>% 
+  tally %>%
+  arrange(-n) %>% 
+  head(10) %>% 
+  ggplot()+
+  geom_bar(aes(x=reorder(type,n),y=n,fill=type),stat = 'identity')+
+  coord_flip()+
+  xlab("type")
+```
+
+#### Volume over time
+
+```{r}
+tickets_tbl %>% 
+  mutate(created_time = sql(date(created_time))) %>% 
+  group_by(created_time) %>% 
+  tally %>%
+  ggplot()+
+  geom_bar(aes(x=created_time,y=n,fill=n),stat = 'identity')+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Volume has a weakly seasonality
+
+## SQL test  (SQLite3)
+
+Since this is a sql test I will no longer use dbplyr to translate for me. So for simplicity I will just use sql chunks
+
+### Add column to calculate the total seconds it took to resolve the ticket
+
+SQLite isn't a very good DB so it does not have timestampdiff, I will calculate a days diff and convert it to seconds?
+
+```{sql, connection = con}
+select 
+  *,
+  (julianday(resolved_time) - julianday(created_time))*24*60*60 as resolved_time_sec
+from tickets
+```
+
+#### Show volume and average resolve time of tickets for each agent
+
+```{sql, connection = con, output.var="agent_performance"}
+with resolve_time as (
+select 
+  *,
+  (julianday(resolved_time) - julianday(created_time))*24*60*60 as resolved_time_sec
+from tickets
+)
+select 
+  agent_id,
+  count(*) as volume,
+  time(avg(resolved_time_sec), 'unixepoch') as avg_resolved_time
+from resolve_time
+group by agent_id
+order by avg_resolved_time
+
+
+```
+
+```{r}
+agent_performance
+```
+
+#### Repeated exactly for type
+
+```{sql, connection = con, output.var="type_performance"}
+with resolve_time as (
+select 
+  *,
+  (julianday(resolved_time) - julianday(created_time))*24*60*60 as resolved_time_sec
+from tickets
+)
+select 
+  type,
+  count(*) as volume,
+  time(avg(resolved_time_sec), 'unixepoch') as avg_resolved_time
+from resolve_time
+group by type
+order by avg_resolved_time
+```
+
+```{r}
+type_performance
+```
+
+#### Load top 10 AI students data into DB
+
+```{r}
+top_10_students_df = data.table::fread("../data/raw/top_10_MIT_AI_2018_01_31 (1) (1).csv")
+DBI::dbWriteTable(con, "top_ten", top_10_students_df)
+
+```
+
+View the data
+
+```{sql, connection = con}
+select * from top_ten 
+```
+
+#### Type and number of agent interactions of the last observed interaction for top 10 students
+
+I'm not sure what `interaction` is per se. Since it could be any one of the 3 time stamps (if others are not populated for example) I will need to calculate the max over the row to find the max interaction of that row and then for each student find that ticket that corresponds to the max of those max... 
+
+There's probably a more succinct way of doing this but w/e
+
+```{sql, connection = con}
+with calc_interaction as (
+  select
+    a.user_id,
+    max(created_time,resolved_time,initial_time) as max_interaction,
+    type,
+    agent_interactions
+  from tickets a
+  inner join top_ten b
+  on a.user_id = b.user_id
+), per_user_max as (
+  select 
+    *,
+    max(max_interaction) over (partition by user_id) as user_max_interaction
+  from calc_interaction 
+)
+select
+    user_id,
+    max_interaction,
+    type,
+    agent_interactions
+from per_user_max
+where max_interaction = user_max_interaction
+```
+
+## Mini Analyst
+
+### Looking at question 2 and 3 what sugestions would you make the Education-student-success team
+
+Questions 2 and 3 were evaluating the relationships between type, volume and average resolution time over agents.
+
+Calculate basic volume and time required over type and angent:
+
+```{r}
+cast_dates =
+  . %>% 
+  map_if(grepl(pattern = "time",x = names(.)),~.x %>% strptime("%Y-%m-%d %H:%M")) %>%
+  as.data.frame()
+
+performance = 
+  tickets_tbl %>% 
+  collect %>% 
+  cast_dates %>% 
+  mutate(resolution_time = resolved_time-created_time) %>% 
+  group_by(agent_id,type) %>% 
+  summarise(avg_resolution_sec = mean(resolution_time,na.rm = T),
+            volume = n()) 
+
+performance
+
+```
+
+Volume and resolution time appear inversely correlated at first glance. The obvious? reason would be that agents who take long resolving tickets don't have time to do many tickets, or perhaps tickets that do not appear often are low priority. But we may want to ask the question; are experienced agents faster? Or are frequent tickets easier to solve on the platform? Are there certain ticket types that we can improve with some engineering?
+
+```{r}
+performance %>% 
+  filter(type != "Extension Request") %>% 
+  group_by(agent_id) %>% 
+  summarise(volume = sum(volume,na.rm = T),avg_resolution_sec = mean(avg_resolution_sec,na.rm = T)) %>% 
+  ggplot(aes(x=volume,y=avg_resolution_sec))+
+  geom_point()+
+  ggtitle("Seemingly inverse relationship of volume and resolution time", "experience or platform improvements for infrequent problems?")
+```
+
+Looking at the box plots of resolution times between tickets over types we note that within interquartile range querries about complaints and finances take significantly longer to resolve.
+
+```{r,fig.height=10}
+# performance %>% 
+tickets_tbl %>% 
+  collect %>% 
+  cast_dates %>% 
+  mutate(resolution_time = resolved_time-created_time) %>% 
+  ggplot()+
+  # geom_violin(aes(x = type, y = resolution_time, color = type))
+  geom_boxplot(aes(x = type, y = resolution_time, color = type))+
+  coord_flip()+
+  theme(legend.position = "none")
+```
+
+Looking at the average variation between agents however we see that the largest deviation between agents exists in;  
+
+- Student records  
+- Finance  
+- Complaints  
+- Certificates  
+- Appeals  
+
+Therefore we may want to improve methodology here so that resolution of these tickets are more predictable
+
+```{r,fig.height=10}
+performance %>% 
+  ggplot()+
+  # geom_violin(aes(x = type, y = resolution_time, color = type))
+  geom_boxplot(aes(x = type, y = avg_resolution_sec, color = type))+
+  coord_flip()+
+  theme(legend.position = "none")
+```
+
+If we look at variation between agents instead the variation is slightly different.  
+In particular for example; student record/certificate queries, complaints and finance querries' time to resolution vary greatly between agents
+
+One can also try to investigate the data yourself with some interactive widgets;
+
+```{r,eval=FALSE}
+library(plotly)
+performance %>% 
+  highlight_key(~type) %>% 
+  plot_ly( x = ~volume, y = ~avg_resolution_sec, z = ~agent_id, color = ~type, hoverinfo="type") %>% 
+  add_markers() %>% 
+  highlight(on = "plotly_hover", off = "plotly_doubleclick")
+  
+```
+
+We can take a closer look at the agents themselves and show their number of distinct types handles and the total average time they spend resolving tickets;
+
+```{r}
+agent_metrics =
+  performance %>% 
+  ungroup %>% 
+  select(agent_id,type,avg_resolution_sec) %>% 
+  spread(key = type,value = avg_resolution_sec) %>% 
+  ungroup() %>% 
+  mutate(
+    n_types_handled = pmap_dbl(
+      .l = select(., -agent_id),
+      .f = function(...) sum(flatten_dbl(list(...)) > 0,na.rm = T)
+    )
+  ) %>% 
+  mutate(avg_total_resolution_time = pmap_dbl(
+      .l = select(., -agent_id),
+      .f = function(...) reduce(list(...),sum,na.rm = T)
+    )
+  )
+
+agent_metrics
+```
+
+This table representing the high dimensionality of an agents interactions with tickets is difficult to visualize...
+
+But it might reveal some interesting relationships between the resolution times of different ticket types over agents.
+
+Let's sort these tickets into different categories and see if we can measure relationships between types 
+
+```{r, include=FALSE}
+library("FactoMineR")
+library("factoextra")
+
+mfa_df = 
+  agent_metrics %>% 
+ arrange(agent_id) %>% 
+  select(
+    -agent_id,
+  #Certificates
+  `Certificate Query`,
+`Certificate Task`,
+Certificates,
+`Certification Outbound Query`,
+`Certification Outbound Task`,
+  # Complaints
+Complaints,
+`Honour Code/Plagiarism`,
+Appeals,
+Cancellations,
+`Online Campus Errors`,
+`Suspensions Calls`,
+  #General query
+`General Course Announcements`,
+`General Query`,
+`General Task`,
+`Exam Queries`,
+`HT Support Query`,
+`Head Tutor Query`,
+`Sales Query`,
+`Discussion Forum`,
+`Discussion Forum Settings`,
+`Assignment Download`,
+`Assignment Upload`,
+Communication,
+`Extension Request`,
+Login,
+Notes,
+Quiz,
+Software,
+`Teamviewer Sessions`,
+Voicemail,
+  #Performance
+`Student Performance Query`,
+`Student Performance Task`,
+Grades,
+Coaching,
+`Peer Reviews`,
+Results,
+`Video (Playback & Download)`,
+  #Records
+`Student Records Query`,
+`Student Records Task`,
+`ID Upload`,
+Postgrad,
+`Profile Changes`,
+`Student Portal`,
+  #Finance
+`Finance Query`,
+`Sales Task`,
+  #Other
+V1,
+Deferrals,
+`Hetzner/KonsoleH`,
+Groups,
+`Live Sessions`,
+NetVerify,
+`OLC Navigation`,
+Other,
+`Scheduled Calls`,
+`Welcome Interaction`,
+  #Agent
+avg_total_resolution_time,
+n_types_handled
+) 
+```
+
+Setup MFA analysis to investigate relationships in lower dim space
+
+```{r}
+library("FactoMineR")
+library("factoextra")
+
+group_sizes = c(5,6,19,7,6,2,10,2)
+group_names = c('Certificates','Complaints','General query','Performance','Records','Finance','Other','Agent')
+group_types = rep("c",length.out = length(group_names))
+
+source('../src/visualization/MFA_c.R')
+res.mfa <- MFA_c(mfa_df %>% map_df(as.numeric), 
+               group = group_sizes,
+               type = group_types,
+               name.group = group_names,
+               ncp=2
+               )  
+```
+
+We can delve into this a little bit.
+
+Group representation doesn't show particularly distinct relationships;  
+- Performance and Finance tickets are highly correlated  
+- Could investigate relationship between complaints and agent volumes / resolution times (but we know this)  
+- Certificates and general queries behave quite opposite to finance and performance querries (we know this, they resolve quickly)  
+
+On the other hand, the individuals plot of agents show that most agents are quite similar - with notable agents 13, 14 and 19 being outliers in some way.
+
+This is interesting because we see in the box plots that resolution times for some ticket categories varies greatly between agents (e.g. complaints and records).
+
+If agents are randomly allocated to tickets this may simply be inefficient.
+
+On the other hand some ticket categories just take longer and vary more in general... Those should be revised and perhaps streamlined.
+
+```{r}
+res.mfa %>% 
+  fviz_screeplot
+```
+
+We should also be careful interpreting low dimensional representations since the eigenvalues don't show a particularly high level of explained variance.  
+
+```{r}
+fviz_contrib(res.mfa, "group", axes = 1)
+# Contribution to the second dimension
+fviz_contrib(res.mfa, "group", axes = 2)
+```
+
+The contribution plots also show that many types are similar in polar coordinates.
+
+Let's take a closer look between agents that score high on the 3 ticket groups;  
+- Complaints  
+- Finance/Performance  
+- General querries  
+
+We can view the top 5 agents scored on mean resolution time within each category
+
+```{r, include=FALSE}
+
+category_data = 
+performance %>% 
+  mutate(ticket_category = case_when(
+    type %in% c('Complaints',
+'Honour Code/Plagiarism',
+'Appeals',
+'Cancellations',
+'Online Campus Errors',
+'Suspensions Calls') ~ 'complaints',
+type %in% c('Student Performance Query',
+'Student Performance Task',
+'Grades',
+'Coaching',
+'Peer Reviews',
+'Results',
+'Video (Playback & Download)',
+'Finance Query',
+'Sales Task') ~ 'performance_finance',
+type %in% c('General Course Announcements',
+'General Query',
+'General Task',
+'Exam Queries',
+'HT Support Query',
+'Head Tutor Query',
+'Sales Query',
+'Discussion Forum',
+'Discussion Forum Settings',
+'Assignment Download',
+'Assignment Upload',
+'Communication',
+'Extension Request',
+'Login',
+'Notes',
+'Quiz',
+'Software',
+'Teamviewer Sessions',
+'Voicemail'
+) ~ 'general',
+TRUE ~ 'other'
+  )) %>% 
+  group_by(agent_id,ticket_category) %>% 
+  summarise(avg_resolution_sec = mean(avg_resolution_sec,na.rm = T), volume = sum(volume,na.rm = T)) 
+```
+
+```{r}
+category_data %>% 
+  ggplot()+
+  geom_bar(aes(x=agent_id,y=avg_resolution_sec, fill = ticket_category),stat='identity')+
+  facet_wrap(~ticket_category)+
+  ggtitle("Average resolution times per category of tickets over agents")
+```
+
+```{r}
+category_data %>% 
+  ggplot()+
+  geom_bar(aes(x=agent_id,y=volume, fill = ticket_category),stat='identity')+
+  facet_wrap(~ticket_category)+
+  ggtitle("Ticket volumes over agents for each ticket category")
+
+```
+
+This confirms the individuals plot of the MFA - most agents behave the same and are equally distributed between the different ticket categories. Also the outlier agents are likely due to outlier tickets that proved difficult to resolve.  
+
+When agents recieve complaints/finance/performance tickets they may take up a lot of time and reduce the volume of tickets these agents can address
+
+## R test
+
+### Import ticket data
+
+```{r}
+ticket_data201803 = data.table::fread("../data/raw/ticket_data201803 (1) (1).csv")
+```
+
+### Course CAM-BSM-2018-02-21 and >= 4 agent interactions
+
+```{r}
+ticket_data201803 %>% 
+  filter(agent_interactions > 3) %>% 
+  filter(course == 'CAM-BSM-2018-02-21')
+```
+
+### Customer interactions GS-ID-2018-02-15
+
+```{r}
+ticket_data201803 %>% 
+  filter(course == 'GS-ID-2018-02-15') %>% 
+  pull(customer_interactions) 
+```
+
+### Replace NA's of previous
+
+```{r}
+ticket_data201803 %>% 
+  filter(course == 'GS-ID-2018-02-15') %>% 
+  pull(customer_interactions) %>% 
+  replace_na(replace = mean(., na.rm = T))
+```
+

@@ -1,0 +1,370 @@
+---
+title: "2U challenge - part 2"
+author: Stefan Fouche
+output:
+  html_notebook:
+    toc: true
+    theme: journal
+    toc_float:
+      collapsed: false
+---
+
+## Load and view first dataset
+
+```{r}
+library(tidyverse)
+df_1 = data.table::fread("../data/raw/Data Science SAE data - dataset 1.csv")
+
+df_1
+```
+
+It seems as though the data is on an opportunity - person grain.
+
+Each combination has a predicted enrollment probability and actual enrollment status (presumably at present?).
+
+It's not clear to me what the start date means but for now I will assume the start date refers to the first time an opportunity was outbound/communicated to a person.
+
+```{r}
+df_1 %>% 
+  group_by(opportunity_id,start_date) %>% 
+  tally %>% 
+  arrange(-n)
+```
+
+Some opportunities have multiple start dates...
+
+```{r}
+df_1 %>% 
+  filter(opportunity_id == '0061N00000aCe5ZQAS')
+```
+
+First example case was a duplicate????? Why are there duplicates?
+
+### Dedup the data
+
+The data had dimensions `r df_1 %>% dim`
+
+If we remove duplicates we have dimensions;
+
+```{r}
+df_1 %>% 
+  unique() %>% 
+  dim
+```
+
+We will remove all duplicates
+
+```{r}
+df_1 = df_1 %>% unique()
+```
+
+Let's confirm opportunity - start date counts
+
+```{r}
+df_1 %>% 
+  group_by(opportunity_id,start_date) %>% 
+  tally %>% 
+  arrange(-n)
+```
+
+First case
+
+```{r}
+df_1 %>% 
+  filter(opportunity_id == '0061N00000YQ3QmQAL')
+```
+
+:(
+
+### Find and replace duplicate categorical features
+
+```{r}
+df_1 %>% 
+  group_by(enroll_status) %>% 
+  summarise %>% 
+  arrange(enroll_status)
+```
+
+```{r}
+df_1 =
+  df_1 %>% 
+  mutate(enroll_status = if_else(enroll_status == 'Enrolled','enrolled',enroll_status))
+```
+
+Check opportunity - start date parity
+
+```{r}
+df_1 = df_1 %>% unique()
+
+df_1 %>% 
+  group_by(opportunity_id,start_date) %>% 
+  tally %>% 
+  arrange(-n)
+```
+
+Store cleaning steps for our data pipeline (should we need to model later)
+
+```{r}
+clean_data =
+  . %>% 
+  mutate(enroll_status = if_else(enroll_status == 'Enrolled','enrolled',enroll_status)) %>% 
+  unique() %>% 
+  mutate(predicted_enrollment = as.numeric(predicted_enrollment))
+```
+
+## Data wrangling
+
+```{r}
+df_1 = data.table::fread("../data/raw/Data Science SAE data - dataset 1.csv")
+
+df_1 = 
+  df_1 %>% 
+  clean_data
+
+df_1
+```
+
+### First opportunity enrollments
+
+We will assume first opportunity refers to the first outbount for a given person...
+
+Let's see how many oppertunities people recieve
+
+```{r}
+df_1 %>% 
+  group_by(person_code) %>% 
+  summarise(n_opper = n_distinct(opportunity_id)) %>% 
+  ggplot()+
+  geom_histogram(aes(x=n_opper))
+```
+
+Some people recieve a lot of offers! 
+
+Most people recieve between 1 and 5 opportunities.
+
+Let's see how many people enrol the first time an outbound message is recieved
+
+```{r}
+df_1 %>% 
+  group_by(person_code) %>% 
+  filter(start_date == min(start_date)) %>% 
+  ungroup %>% 
+  group_by(enroll_status) %>% 
+  tally %>% 
+  mutate(percentage = n/sum(n))
+```
+
+### Time between first enrollment and interest in next course
+
+The question is worded in a way that makes me think each `opportunity_id` is recorded due to a user interaction asking for information about an oppertunity.
+
+I will assume this is true and measure the time between first enrollment and the next oppertunity regardless of enrollment
+
+This is as easy as sorting each person on time, taking the lag and returning the date difference of the first interaction
+
+```{r}
+time_to_next = 
+  df_1 %>% 
+  mutate_if(names(df_1) %>% grepl(pattern = "date"),as.Date) %>% 
+  arrange(start_date) %>% 
+  group_by(person_code) %>% 
+  mutate(lead_start_date = lead(start_date)) %>% 
+  left_join(df_1 %>% 
+              group_by(person_code) %>% 
+              filter(enroll_status == 'enrolled') %>% 
+              summarise(first_enrol_date = min(start_date)) %>% 
+              select(person_code,first_enrol_date)
+            ) %>% 
+  filter(start_date == first_enrol_date) %>% 
+  transmute(time_to_next_opportunity = lead_start_date - start_date)
+
+time_to_next
+```
+
+So on average;
+
+```{r}
+time_to_next %>% 
+  ungroup %>% 
+  summarise(mean(time_to_next_opportunity,na.rm = T))
+```
+
+Interesting...
+
+Is there a monthly/weekly cycle?
+
+```{r}
+time_to_next %>% 
+  ggplot()+
+  geom_histogram(aes(x = time_to_next_opportunity))
+```
+
+Nevermind!
+
+### Let's try to visualize model accuracy
+
+We can start by visualizing raw predictions with a confusion matrix.
+
+We will assume that the model was calibrated to predict enrollment if probability is over %50 (which might not be true depending on how the model was calibrated for precision recall)
+
+```{r}
+df_1 %>% 
+  mutate(predicted = round(predicted_enrollment)) %>% 
+  select(enroll_status,predicted) %>% 
+  table
+```
+
+Hmmm!?
+
+Let's look at the model prediction density
+
+```{r}
+df_1 %>% 
+  ggplot()+
+  geom_density(aes(x=predicted_enrollment))
+```
+
+Let's calculate some performance metrics!?
+
+```{r}
+library(yardstick)
+
+metric_data =
+  df_1 %>% 
+  mutate(predicted = round(predicted_enrollment)) %>% 
+  select(enroll_status,predicted,predicted_enrollment) %>% 
+  mutate(enroll_status = if_else(enroll_status == 'enrolled', 1, 0)) %>% 
+  mutate(enroll_status = as.factor(enroll_status)) %>%
+  mutate(predicted = as.factor(predicted))
+
+metric_data %>% 
+  metrics(enroll_status, predicted) %>% 
+  bind_rows(
+  metric_data %>% 
+  roc_auc(enroll_status, predicted_enrollment)
+  )
+
+
+```
+
+So it would seem that our model may have struggled with class balance (based on kappa statistic and never predicting positive sentiment even though quite a few people ended up enrolling).
+
+We may also want to see if the calibration of the model at least ranks...
+
+```{r}
+df_1 %>% 
+  ggplot()+
+  geom_point(aes(x=predicted_enrollment,y=enroll_status))
+```
+
+That doesn't look like it ranks :(
+
+We can do a statistical test for rigour
+
+```{r}
+enrol_groups =
+  df_1 %>% 
+  select(opportunity_id,enroll_status,predicted_enrollment) %>% 
+  spread(key = enroll_status,value = predicted_enrollment)
+
+ks.test(enrol_groups %>% pull(enrolled) %>% purrr::discard(is.na),enrol_groups %>% pull(`(null)`) %>% purrr::discard(is.na))
+```
+
+Well, at least the 2 ditributions are different (so the model appears to be better than random)
+
+## Part 2
+
+### Use twitter api
+
+Load twitter users
+
+```{r}
+library(reticulate)
+```
+
+```{python}
+import pandas as pd
+import numpy as np
+import time
+import twython
+from twython import Twython
+import json
+import re
+```
+
+
+```{python}
+people = pd.read_csv("../data/raw/Data Science SAE data - dataset 2.csv")
+```
+
+```{r}
+py$people
+```
+
+We want to collect tweets for these users...
+
+Someone thought it would be funny to add whitespace characters to the data :(  
+It wasn't funny  
+
+```{python}
+# Load credentials from json file
+with open("../twitter_credentials.json", "r") as file:
+    creds = json.load(file)
+    
+```
+
+```{python}
+python_tweets = Twython(creds['CONSUMER_KEY'], creds['CONSUMER_SECRET'])
+```
+
+
+```{python}
+def get_user_data(tw_name,tw_api):
+    try:
+        print('getting data for {}'.format(tw_name))
+        tw_name = re.sub('[^\w\s]', '', tw_name)
+        tw_data = tw_api.show_user(screen_name=tw_name)
+    except Exception as e:
+        print(e)
+        return(None)
+    else:
+        return(tw_data)
+```
+
+
+```{python}
+dict_ = {'username': [], 'date': [], 'id' : [], 'text': []}
+for index, row in people.iterrows():
+    tw_name = row[0]
+    print(tw_name)
+    twitter_data = get_user_data(tw_name,python_tweets)
+    time.sleep(3)
+    if twitter_data is not None:
+        print('appending data')
+        dict_['id'].append(twitter_data['id'])
+        dict_['username'].append(twitter_data['screen_name'])
+        dict_['date'].append(twitter_data["status"]['created_at'])
+        dict_['text'].append(twitter_data["status"]["text"])
+
+# Structure data in a pandas DataFrame for easier manipulation
+df = pd.DataFrame(dict_)
+df
+```
+
+Saving to csv
+
+```{python}
+df.to_csv("../data/processed/twitter.csv")
+```
+
+### How can we use twitter data
+
+Twitter is great source for data.
+
+We can use twitter to find potential leads by looking for users following/retweating/commenting on posts/people related to a course or opportunity we want to promote.
+
+We can analyse the tweets of prospective users using for example transformer networks to predict if a user will enroll/pass
+
+We can create graphs of prospective or past customers to predict using for example convolutional graph neural networks if related/connected users would enroll
+
+etc.

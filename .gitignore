@@ -82,5 +82,6 @@ target/
 .DS_Store
 
 ## ignore twitter credentials
-twitter_credentials.json.Rhistory
+twitter_credentials.json
+.Rhistory
 .Rproj.user

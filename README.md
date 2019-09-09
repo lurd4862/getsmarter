@@ -14,7 +14,7 @@ You will need these to run development environment;
 - docker
 - make
 
-Clone this repo and open a shell in container.
+Clone this repo and open a shell in folder.
 
 ### Spinup Rstudio
 
